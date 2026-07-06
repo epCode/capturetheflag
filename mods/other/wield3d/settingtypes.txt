@@ -1,0 +1,9 @@
+#    Time interval (in seconds) for refreshing wielded objects.
+wield3d_update_time (Wield item update time) float 1.0 0.0 5.0
+
+#    Time interval (in seconds) for performing sanity-checks on the wield item object.
+#    This restores vanished objects, or removes duplicates.
+wield3d_verify_time (Wield item verify time) float 10.0 1.0 30.0
+
+#    How large the wield item should be.
+wield3d_scale (Wield item scale) float 0.25 0.1 0.5
