@@ -88,12 +88,35 @@ local simplify_item_name = function(iname)
 	return iname
 end
 
+-- Initial-stuff expanders: let other mods turn a single item a mode hands out
+-- (e.g. a gun name) into several stacks (loaded gun + spare mag + ammo) without
+-- the mode needing to know about that mod. Each fn(item_name, player) returns a
+-- list of items/ItemStacks, or nil to leave the item untouched.
+ctf_modebase.registered_stuff_expanders = {}
+
+function ctf_modebase.register_stuff_expander(func)
+	table.insert(ctf_modebase.registered_stuff_expanders, func)
+end
+
+-- Expand one item into a list of items (defaults to just {item}).
+function ctf_modebase.expand_stuff(item, player)
+	if type(item) == "string" then
+		for _, expander in ipairs(ctf_modebase.registered_stuff_expanders) do
+			local expanded = expander(item, player)
+			if expanded then return expanded end
+		end
+	end
+	return {item}
+end
+
 -- Changes made to this function should also be made to is_initial_stuff() above
 local function get_initial_stuff(player, f)
 	local mode = ctf_modebase:get_current_mode()
 	if mode and mode.stuff_provider then
 		for _, item in ipairs(mode.stuff_provider(player)) do
-			f(ItemStack(item))
+			for _, expanded in ipairs(ctf_modebase.expand_stuff(item, player)) do
+				f(ItemStack(expanded))
+			end
 		end
 	end
 

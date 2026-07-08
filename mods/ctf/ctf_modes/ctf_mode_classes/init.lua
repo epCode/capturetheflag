@@ -99,15 +99,12 @@ ctf_modebase.register_mode("classes", {
 		end
 	end,
 	stuff_provider = function(player)
+		-- Gun names are expanded into full kits (loaded gun + spare mag + ammo)
+		-- by ctf_modebase.expand_stuff, via the stuff_expander bestguns_ctf
+		-- registers. Modes just list plain item names, so this works whether or
+		-- not the optional bestguns mod is enabled.
 		local initial_stuff = {}
-		for _, item in ipairs(classes.get(player).items or {}) do
-			-- Expand a bestguns gun into a loaded gun + spare mag + ammo kit
-			if bestguns.registered_guns[item] then
-				table.insert_all(initial_stuff, bestguns_ctf.class_loadout(item))
-			else
-				table.insert(initial_stuff, item)
-			end
-		end
+		table.insert_all(initial_stuff, classes.get(player).items or {})
 		table.insert_all(initial_stuff, {"default:pick_stone", "default:torch 15", "default:stick 5"})
 		return initial_stuff
 	end,

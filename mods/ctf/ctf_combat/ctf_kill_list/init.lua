@@ -140,9 +140,14 @@ minetest.register_on_joinplayer(function(player)
 	update_kill_list_hud(player)
 end)
 
-function ctf_kill_list.add(killer, victim, weapon_image, comment)
+function ctf_kill_list.add(killer, victim, weapon_image, comment, headshot)
 	killer = PlayerName(killer)
 	victim = PlayerName(victim)
+
+	-- Mark headshot kills in the feed by stamping a skull over the weapon icon.
+	if headshot then
+		weapon_image = (weapon_image or "ctf_kill_list_punch.png") .. "^ctf_modebase_skull.png"
+	end
 
 	local k_teamcolor = ctf_teams.get(killer)
 	local v_teamcolor = ctf_teams.get(victim)

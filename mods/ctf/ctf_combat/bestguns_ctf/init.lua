@@ -16,6 +16,12 @@
 	gun's own definition (mag capacity, bullet, load type).
 ]]
 
+-- bestguns is an optional (globally-enabled) mod. If it isn't loaded, CTF simply
+-- runs without guns; do nothing here rather than erroring.
+if not minetest.get_modpath("bestguns") then
+	return
+end
+
 bestguns_ctf = {}
 
 --------------------------------------------------------------------------------
@@ -28,6 +34,7 @@ bestguns_ctf.gun_rarity = {
 	["bestguns:revolver"]      = 0.12,
 	["bestguns:shotgun"]       = 0.06,
 	["bestguns:assault_rifle"] = 0.035,
+	["bestguns:semi_auto_rifle"] = 0.025,
 	["bestguns:bolt_sniper"]   = 0.015,
 	["bestguns:uzi"]           = 0.01,  -- ~20x rarer than the pistol
 }
@@ -150,19 +157,21 @@ local function is_blocked_loot(item)
 	return item:find("^ctf_ranged:") or item:find("^ctf_mode_classes:ranged_rifle")
 end
 
--- Wrap the core treasure filler: strip the old guns, then add ours.
-local old_treasurefy_node = ctf_map.treasure.treasurefy_node
-function ctf_map.treasure.treasurefy_node(inv, map_treasures)
-	local filtered = {}
-	for item, def in pairs(map_treasures) do
-		if not is_blocked_loot(item) then
-			filtered[item] = def
-		end
-	end
+-- Use CTF's treasure API instead of monkeypatching: block the old guns and add
+-- our loot to every chest.
+ctf_map.treasure.register_blocked_item(is_blocked_loot)
+ctf_map.treasure.register_filler(bestguns_ctf.fill_chest)
 
-	old_treasurefy_node(inv, filtered)
-	bestguns_ctf.fill_chest(inv)
-end
+--------------------------------------------------------------------------------
+-- Class loadouts
+--------------------------------------------------------------------------------
+-- Expand a bestguns gun name given out by a mode's stuff_provider into a full
+-- kit (loaded gun + spare mag + ammo). Lets modes list plain gun names.
+ctf_modebase.register_stuff_expander(function(item)
+	if bestguns.registered_guns[item] then
+		return bestguns_ctf.class_loadout(item)
+	end
+end)
 
 --------------------------------------------------------------------------------
 -- Class usage restrictions
@@ -185,6 +194,7 @@ local ammo_crafts = {
 	{"bestguns:bullet_9mm 12",  {"default:steel_ingot", "default:coal_lump"}},
 	{"bestguns:bullet_44 6",    {"default:steel_ingot", "default:coal_lump"}},
 	{"bestguns:bullet_39mm 12", {"default:steel_ingot 2", "default:coal_lump"}},
+	{"bestguns:bullet_semi 10", {"default:steel_ingot 2", "default:coal_lump"}},
 	{"bestguns:12_gauge 4",     {"default:steel_ingot", "default:coal_lump"}},
 	{"bestguns:308 4",          {"default:steel_ingot 2", "default:coal_lump 2"}},
 }

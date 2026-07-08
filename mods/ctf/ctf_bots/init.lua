@@ -219,7 +219,8 @@ local function has_los(frompos, topos)
 end
 
 local function shoot(self, mypos, target, targetpos)
-	local bdef = bestguns.registered_bullets[BULLET]
+	-- bestguns is optional; without it bots simply don't shoot.
+	local bdef = bestguns and bestguns.registered_bullets[BULLET]
 	if not bdef then return end
 	local from = vector.new(mypos.x, mypos.y + EYE, mypos.z)
 	local speed = bdef.speed or 200

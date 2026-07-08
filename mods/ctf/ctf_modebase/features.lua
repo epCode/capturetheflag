@@ -412,7 +412,7 @@ local function drop_flag(teamname)
 	end
 end
 
-local function end_combat_mode(player, reason, killer, weapon_image)
+local function end_combat_mode(player, reason, killer, weapon_image, headshot)
 	local comment = nil
 
 	if ctf_teams.get(player) then
@@ -455,7 +455,7 @@ local function end_combat_mode(player, reason, killer, weapon_image)
 			total_enemy_reward = total_enemy_reward + rewards.score
 
 			if ctf_teams.get(killer) then
-				ctf_kill_list.add(killer, player, weapon_image, comment)
+				ctf_kill_list.add(killer, player, weapon_image, comment, headshot)
 				hud_events.new(player, {
 					quick = false,
 					text = killer .. " " .. S("killed you for") .. " " .. rewards.score .." " .. S("points!"),
@@ -989,9 +989,10 @@ return {
 		end
 
 		local weapon_image = get_weapon_image(hitter, tool_capabilities)
+		local headshot = tool_capabilities.damage_groups and tool_capabilities.damage_groups.headshot
 
 		if player:get_hp() <= damage then
-			end_combat_mode(player:get_player_name(), "punch", hitter:get_player_name(), weapon_image)
+			end_combat_mode(player:get_player_name(), "punch", hitter:get_player_name(), weapon_image, headshot)
 		elseif player:get_player_name() ~= hitter:get_player_name() then
 			ctf_combat_mode.add_hitter(player, hitter, weapon_image, 15)
 		end
