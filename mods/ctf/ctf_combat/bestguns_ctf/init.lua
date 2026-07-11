@@ -28,15 +28,31 @@ bestguns_ctf = {}
 -- ROSTER / RARITY TABLE  (edit me!)
 --------------------------------------------------------------------------------
 -- Per-chest spawn chance for each gun. Higher = more common.
--- Ordering requested: pistol > revolver > shotgun > assault rifle > bolt action.
+-- Grouped by family; sidearms are common, rifles/snipers rare.
+-- (bestguns:pistol is intentionally omitted -- disabled for now, replaced by the glock.)
 bestguns_ctf.gun_rarity = {
-	["bestguns:pistol"]        = 0.20,  -- by far the most common
-	["bestguns:revolver"]      = 0.12,
-	["bestguns:shotgun"]       = 0.06,
-	["bestguns:assault_rifle"] = 0.035,
+	-- Sidearms
+	["bestguns:glock"]           = 0.20,  -- by far the most common (replaced the pistol, disabled for now)
+	["bestguns:snub_revolver"]   = 0.15,  -- cheap, compact .38
+	["bestguns:revolver"]        = 0.12,  -- .44 Magnum
+	["bestguns:deagle"]          = 0.03,  -- .44 hand cannon, uncommon
+
+	-- Shotguns
+	["bestguns:shotgun"]         = 0.06,
+	["bestguns:sawed_shotgun"]   = 0.05,
+
+	-- SMGs
+	["bestguns:tommy"]           = 0.015,
+	["bestguns:uzi"]             = 0.01,  -- ~20x rarer than the glock
+
+	-- Rifles
+	["bestguns:carbine"]         = 0.04,
+	["bestguns:assault_rifle"]   = 0.035,
+	["bestguns:ak47"]            = 0.03,
 	["bestguns:semi_auto_rifle"] = 0.025,
-	["bestguns:bolt_sniper"]   = 0.015,
-	["bestguns:uzi"]           = 0.01,  -- ~20x rarer than the pistol
+
+	-- Sniper
+	["bestguns:bolt_sniper"]     = 0.015,
 }
 
 -- Loot tuning (all editable). Chances below are multiplied by a gun's rarity
@@ -194,7 +210,7 @@ local ammo_crafts = {
 	{"bestguns:bullet_9mm 12",  {"default:steel_ingot", "default:coal_lump"}},
 	{"bestguns:bullet_44 6",    {"default:steel_ingot", "default:coal_lump"}},
 	{"bestguns:bullet_39mm 12", {"default:steel_ingot 2", "default:coal_lump"}},
-	{"bestguns:bullet_semi 10", {"default:steel_ingot 2", "default:coal_lump"}},
+	{"bestguns:bullet_45acp 10", {"default:steel_ingot 2", "default:coal_lump"}},
 	{"bestguns:12_gauge 4",     {"default:steel_ingot", "default:coal_lump"}},
 	{"bestguns:308 4",          {"default:steel_ingot 2", "default:coal_lump 2"}},
 }
