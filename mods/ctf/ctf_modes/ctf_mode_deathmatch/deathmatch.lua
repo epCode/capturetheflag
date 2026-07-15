@@ -3,10 +3,18 @@ local S = minetest.get_translator(minetest.get_current_modname())
 -- Flat score bonus awarded to each surviving winner at the end of a round.
 local WIN_BONUS = 250
 
--- Minimum spacing between team spawn anchors, and the range within which a clear
--- line of sight between two anchors is considered "they can see each other".
-local MIN_ANCHOR_DIST = 24
-local VIS_DIST = 140
+-- Spawn quality tiers, by clear air above the ground (headroom):
+--   IDEAL_HEADROOM+  -> "great": open land, the spawns we want.
+--   MIN_HEADROOM..   -> "ok"   : usable but cramped (tunnels/overhangs), fallback.
+--   below MIN        -> illegal: jammed under a barrier/in a wall, never spawned on.
+-- A player is 2 nodes tall, so MIN_HEADROOM must stay >= 2.
+local IDEAL_HEADROOM = 5
+local MIN_HEADROOM = 2
+local HEADROOM_CAP = 8  -- stop counting air past this; anything >= IDEAL is "great"
+
+-- Target size of the candidate pool sampled per spawn computation. Bigger = more
+-- room for the spread pass to work with, at a small extra sampling cost.
+local POOL_TARGET = 240
 
 -- Radius around a team's anchor that its members are clustered into.
 local CLUSTER_RADIUS = 6
@@ -16,6 +24,10 @@ local MAX_HP = minetest.PLAYER_MAX_HP_DEFAULT * 10
 -- Grace period at the start of each round during which participants are fully
 -- immune (invulnerable + non-pointable), so nobody gets spawn-killed.
 local ROUND_IMMUNITY_SECONDS = 30
+
+-- Short grace period granted to a freshly-infected player (Infection mode) so
+-- they aren't instantly re-killed the moment they switch sides.
+local INFECT_IMMUNITY_SECONDS = 3
 
 --------------------------------------------------------------------------------
 -- Shared module
@@ -33,8 +45,92 @@ ctf_mode_deathmatch = {
 
 	-- true only while ctf_mode_deathmatch.allocate_teams() is assigning teams
 	round_starting = false,
+
+	-- [pname] = true while an Infection team-switch is in progress. Lets
+	-- on_allocplayer tell a conversion apart from a genuine mid-round join (which
+	-- should spectate) so the infected player keeps fighting instead.
+	converting = {},
+
+	-- [pname] = position the player last died at (Infection revives them there,
+	-- right next to whoever infected them).
+	death_pos = {},
 }
 local dm = ctf_mode_deathmatch
+
+--------------------------------------------------------------------------------
+-- Infection team pool
+--------------------------------------------------------------------------------
+
+-- Infection starts every player on their own solo team, so it needs many more
+-- teams than the handful of fixed colours ctf_teams ships with. dm.register_
+-- infection_teams() registers a pool of distinctly-coloured teams up front; the
+-- ordered list of their names lives here. They are flagged not_playing so no
+-- other mode (e.g. free-for-all Death Match) ever hands them out.
+dm.infection_teams = {}
+
+-- Set form of the above, for O(1) "is this an infection team?" validation.
+dm.infection_team_set = {}
+
+-- Converts an HSV colour (h in degrees, s/v in 0..1) to a "#rrggbb" string.
+local function hsv_to_hex(h, s, v)
+	h = h % 360
+	local c = v * s
+	local x = c * (1 - math.abs((h / 60) % 2 - 1))
+	local m = v - c
+	local r, g, b
+	if     h <  60 then r, g, b = c, x, 0
+	elseif h < 120 then r, g, b = x, c, 0
+	elseif h < 180 then r, g, b = 0, c, x
+	elseif h < 240 then r, g, b = 0, x, c
+	elseif h < 300 then r, g, b = x, 0, c
+	else                r, g, b = c, 0, x end
+	return string.format("#%02x%02x%02x",
+		math.floor((r + m) * 255 + 0.5),
+		math.floor((g + m) * 255 + 0.5),
+		math.floor((b + m) * 255 + 0.5))
+end
+
+-- The ten team colours, handed out in this order. This also caps the number of
+-- teams (players beyond the tenth spectate until the next round).
+local INFECTION_BASE_COLORS = {
+	"#ff0000", -- red
+	"#00c000", -- green
+	"#2050ff", -- blue
+	"#ffe000", -- yellow
+	"#00c4c4", -- teal
+	"#8b4513", -- brown
+	"#1c1c1c", -- black
+	"#ffffff", -- white
+	"#ff8000", -- orange
+	"#9b1fff", -- purple
+}
+
+-- Registers `count` distinctly-coloured solo teams for Infection. Call once at
+-- load time (idempotent). Registered late so the per-team node/registration
+-- loops in ctf_teams (chests, doors, traps) don't run for these throwaway teams.
+function dm.register_infection_teams(count)
+	for i = 1, count do
+		local tname = "infect_" .. i
+		if not ctf_teams.team[tname] then
+			-- Use the curated bold palette first; only once it runs out do we
+			-- fall back to generated bright, fully-saturated hues.
+			local color = INFECTION_BASE_COLORS[i]
+			if not color then
+				color = hsv_to_hex((i * 137.508) % 360, 1, 1)
+			end
+
+			ctf_teams.team[tname] = {
+				color = color,
+				color_hex = tonumber("0x" .. color:sub(2)),
+				irc_color = 16,
+				not_playing = true,
+			}
+			table.insert(ctf_teams.teamlist, tname)
+			table.insert(dm.infection_teams, tname)
+			dm.infection_team_set[tname] = true
+		end
+	end
+end
 
 --------------------------------------------------------------------------------
 -- Spawn point generation (players spawn where they can't see one another)
@@ -100,9 +196,10 @@ local function make_surface_finder(map)
 	end
 
 	-- Returns the standing position (feet) on the first solid, safe ground at
-	-- x,z, skipping past barriers/canopies, or nil if the column is unsuitable.
-	-- Guarantees two nodes of clear air above the ground so the player has room
-	-- to stand and walk (never embedded in the ground or a wall).
+	-- x,z, skipping past barriers/canopies, plus the headroom (count of clear air
+	-- nodes above the ground, capped at HEADROOM_CAP). Returns nil for unsuitable
+	-- columns: outside the field, over a hazard, or with less than MIN_HEADROOM
+	-- air (jammed under a barrier/overhang, i.e. an illegal in-the-wall spot).
 	local function surface_at(x, z)
 		if x < field1.x or x > field2.x or z < field1.z or z > field2.z then
 			return nil
@@ -112,13 +209,22 @@ local function make_surface_finder(map)
 		for y = field2.y - 1, field1.y + 1, -1 do
 			local result = classify(data[area:index(x, y, z)])
 			if result == "ground" then
-				-- Need genuine air for the feet and head, otherwise the spot is
-				-- jammed under a barrier/overhang.
-				if data[area:index(x, y + 1, z)] == c_air and
-				   data[area:index(x, y + 2, z)] == c_air then
-					return vector.new(x, y + 1, z)
+				-- Measure the clear-air column above the ground. This is the spawn
+				-- quality signal: open sky scores high, a 2-node tunnel scores low,
+				-- anything under MIN_HEADROOM is rejected outright.
+				local air = 0
+				for h = 1, HEADROOM_CAP do
+					local yy = y + h
+					if yy > field2.y or data[area:index(x, yy, z)] ~= c_air then
+						break
+					end
+					air = air + 1
 				end
-				return nil
+
+				if air < MIN_HEADROOM then
+					return nil
+				end
+				return vector.new(x, y + 1, z), air
 			elseif result == "block" then
 				return nil
 			end
@@ -134,56 +240,42 @@ local function make_surface_finder(map)
 	return surface_at, b1, b2
 end
 
--- Picks `count` positions from `pool` that are spread out and, where possible,
--- cannot see each other (no clear line of sight). Falls back to maximal spacing.
-local function pick_spread_anchors(pool, count)
-	local chosen = {}
-
-	for _, c in ipairs(pool) do
-		if #chosen >= count then break end
-
-		local ok = true
-		for _, s in ipairs(chosen) do
-			local d = vector.distance(c, s)
-			if d < MIN_ANCHOR_DIST then
-				ok = false
-				break
-			end
-			if d < VIS_DIST and minetest.line_of_sight(
-				vector.offset(c, 0, 1.5, 0), vector.offset(s, 0, 1.5, 0)
-			) then
-				ok = false
-				break
-			end
-		end
-
-		if ok then
-			table.insert(chosen, c)
-		end
+-- Farthest-point sampling: greedily grows `chosen` (a list of positions) until
+-- it holds `want` of them, each time adding the pool candidate whose distance to
+-- the nearest already-chosen point is largest. This maximises the minimum spacing
+-- between spawns -> players end up as spread out as the map allows, on opposite
+-- sides rather than clumped. Candidates are {pos = vector, air = headroom}.
+-- Seeds (when `chosen` is empty) from the most open candidate so the spread grows
+-- out from the best spot.
+local function farthest_point_select(pool, want, chosen)
+	chosen = chosen or {}
+	if #pool == 0 then
+		return chosen
 	end
 
-	-- Not enough mutually-hidden spots: relax the LOS rule and just maximise distance.
-	if #chosen < count then
+	if #chosen == 0 then
+		local best = pool[1]
 		for _, c in ipairs(pool) do
-			if #chosen >= count then break end
+			if c.air > best.air then best = c end
+		end
+		table.insert(chosen, best.pos)
+	end
 
-			local too_close = false
-			local duplicate = false
+	while #chosen < want do
+		local best_pos, best_d = nil, -1
+		for _, c in ipairs(pool) do
+			-- Distance to the nearest spawn already committed.
+			local nearest = math.huge
 			for _, s in ipairs(chosen) do
-				if vector.equals(c, s) then
-					duplicate = true
-					break
-				end
-				if vector.distance(c, s) < MIN_ANCHOR_DIST / 2 then
-					too_close = true
-					break
-				end
+				local d = vector.distance(c.pos, s)
+				if d < nearest then nearest = d end
 			end
-
-			if not duplicate and not too_close then
-				table.insert(chosen, c)
+			if nearest > best_d then
+				best_d, best_pos = nearest, c.pos
 			end
 		end
+		if not best_pos then break end
+		table.insert(chosen, best_pos)
 	end
 
 	return chosen
@@ -194,34 +286,52 @@ end
 function dm.compute_spawns(map, team_members)
 	local surface_at, b1, b2 = make_surface_finder(map)
 
-	local function random_surface()
-		for _ = 1, 60 do
-			local x = math.random(b1.x, b2.x)
-			local z = math.random(b1.z, b2.z)
-			local p = surface_at(x, z)
-			if p then return p end
+	-- Sample random columns and bucket the legal ones by quality. `great` = open
+	-- land (>= IDEAL_HEADROOM air), `ok` = cramped-but-usable. Illegal columns
+	-- (in walls, over hazards, jammed under barriers) are dropped by surface_at.
+	-- Positions are de-duplicated by x,z so the spread pass sees distinct spots.
+	local great, ok = {}, {}
+	local seen = {}
+	for _ = 1, POOL_TARGET * 5 do
+		if #great + #ok >= POOL_TARGET then break end
+		local x = math.random(b1.x, b2.x)
+		local z = math.random(b1.z, b2.z)
+		local key = x * 100000 + z
+		if not seen[key] then
+			seen[key] = true
+			local p, air = surface_at(x, z)
+			if p then
+				local cand = {pos = p, air = air}
+				if air >= IDEAL_HEADROOM then
+					table.insert(great, cand)
+				else
+					table.insert(ok, cand)
+				end
+			end
 		end
-		return nil
 	end
-
-	-- Build a pool of candidate ground positions to choose anchors from.
-	local pool = {}
-	for _ = 1, 600 do
-		if #pool >= 220 then break end
-		local p = random_surface()
-		if p then table.insert(pool, p) end
-	end
-	table.shuffle(pool)
 
 	local teamnames = {}
 	for tname in pairs(team_members) do
 		table.insert(teamnames, tname)
 	end
 	table.sort(teamnames)
+	local count = #teamnames
 
-	local anchors = pick_spread_anchors(pool, #teamnames)
-	-- Last-resort anchor: a real surface near the field centre, else the centre.
-	local fallback = random_surface() or
+	-- Prefer the "great" pool: spread anchors across the open-land spots. Only if
+	-- there aren't enough of them do we top up from "ok", continuing the same
+	-- spread pass so the cramped fallbacks still sit far from everyone else.
+	local anchors
+	if #great >= count then
+		anchors = farthest_point_select(great, count)
+	else
+		anchors = farthest_point_select(great, #great)
+		anchors = farthest_point_select(ok, count, anchors)
+	end
+
+	-- Last-resort anchor: the most open candidate found, then the field centre.
+	local best_any = great[1] or ok[1]
+	local fallback = (best_any and best_any.pos) or
 		surface_at(math.floor((b1.x + b2.x) / 2), math.floor((b1.z + b2.z) / 2)) or
 		map.flag_center
 
@@ -263,6 +373,56 @@ local function teleport_player(player, pos)
 	apply()
 	-- Re-apply shortly after to defeat the engine respawn-position race.
 	minetest.after(0.1, apply)
+end
+
+-- Infection has no spectators: a player who joins mid-round is dropped straight
+-- into the field on a (random) existing team with a short immunity, instead of
+-- being benched until the next round.
+local function infection_join_midround(player)
+	local pname = player:get_player_name()
+	dm.alive[pname] = true
+
+	local map = ctf_map.current_map
+	if map then
+		local team = ctf_teams.get(pname)
+		local spawns = team and dm.compute_spawns(map, {[team] = {pname}})
+		local pos = spawns and spawns[pname]
+		if pos then
+			teleport_player(player, pos)
+		elseif map.flag_center then
+			player:set_pos(map.flag_center)
+		end
+	end
+
+	ctf_modebase.give_immunity(player, INFECT_IMMUNITY_SECONDS)
+end
+
+-- Two-colour particle burst played when a player is infected: a puff in their
+-- old team colour and one in the colour of the team they just joined.
+function dm.infection_burst(pos, old_color, new_color)
+	pos = vector.offset(pos, 0, 1, 0)
+
+	local function puff(color)
+		minetest.add_particlespawner({
+			amount = 35,
+			time = 0.1,
+			minpos = vector.offset(pos, -0.3, -0.3, -0.3),
+			maxpos = vector.offset(pos, 0.3, 0.3, 0.3),
+			minvel = {x = -3, y = 1, z = -3},
+			maxvel = {x = 3, y = 5, z = 3},
+			minacc = {x = 0, y = -6, z = 0},
+			maxacc = {x = 0, y = -9, z = 0},
+			minexptime = 0.4,
+			maxexptime = 1.0,
+			minsize = 1.5,
+			maxsize = 3.5,
+			texture = "default_item_smoke.png^[colorize:" .. color .. ":220",
+			glow = 8,
+		})
+	end
+
+	puff(old_color or "#ffffff")
+	puff(new_color or "#ffffff")
 end
 
 --------------------------------------------------------------------------------
@@ -382,6 +542,8 @@ ctf_api.register_on_match_end(function()
 
 	dm.spectators = {}
 	dm.alive = {}
+	dm.converting = {}
+	dm.death_pos = {}
 end)
 
 --------------------------------------------------------------------------------
@@ -392,6 +554,9 @@ end)
 --       team_chest_items, summary_ranks}
 function dm.make_mode(def)
 	local is_teams = def.is_teams
+	-- Infection: instead of eliminating a killed player, convert them onto their
+	-- killer's team. The round ends when only one team has players left.
+	local is_infection = def.is_infection
 	local rankings = def.rankings
 	local recent_rankings = def.recent_rankings
 	local features = def.features
@@ -458,7 +623,13 @@ function dm.make_mode(def)
 		local tcolor = ctf_teams.team[team] and ctf_teams.team[team].color or "#ffffff"
 		local win_text, summary_text
 
-		if is_teams then
+		if is_infection then
+			win_text = S("@1 Team infected everyone and wins!", HumanReadable(team))
+			summary_text = string.format(
+				"Team %s infected everyone (%d player(s))",
+				HumanReadable(team), #survivors
+			)
+		elseif is_teams then
 			win_text = S("@1 Team Wins!", HumanReadable(team))
 			summary_text = string.format(
 				"Team %s won the deathmatch with %d player(s) standing",
@@ -516,11 +687,53 @@ function dm.make_mode(def)
 		end
 	end
 
+	-- Infection: revive a just-killed player on `new_team` right where they fell,
+	-- next to whoever infected them. If new_team == old_team (a suicide or an
+	-- environmental death with no valid infector) they simply respawn on their
+	-- own side. Ends the round if this conversion left only one team standing.
+	local function infect_player(player, new_team, old_team)
+		local pname = player:get_player_name()
+		local pos = dm.death_pos[pname] or player:get_pos()
+
+		local old_color = ctf_teams.team[old_team] and ctf_teams.team[old_team].color or "#ffffff"
+		local new_color = ctf_teams.team[new_team] and ctf_teams.team[new_team].color or "#ffffff"
+		dm.infection_burst(pos, old_color, new_color)
+
+		-- Switch team without tripping the mid-round spectator path in
+		-- on_allocplayer. This fires on_allocplayer, which heals the player to
+		-- full, re-gears them and recolours them for the new team.
+		dm.converting[pname] = true
+		ctf_teams.set(pname, new_team, true)
+		dm.converting[pname] = nil
+
+		-- They never stopped being an active combatant.
+		dm.alive[pname] = true
+
+		-- Revive on the spot and dismiss the death screen.
+		teleport_player(player, pos)
+		minetest.close_formspec(pname, "")
+		ctf_modebase.give_immunity(player, INFECT_IMMUNITY_SECONDS)
+
+		if new_team ~= old_team then
+			hud_events.new(player, {
+				quick = false,
+				text = S("You were infected! You now fight for the @1 team", HumanReadable(new_team)),
+				color = "warning",
+			})
+		end
+
+		dm.death_pos[pname] = nil
+
+		check_round_end()
+	end
+
 	-- Allocate players into teams and scatter them to hidden spawn points.
 	local function allocate_teams(map_teams)
 		dm.round_starting = true
 		dm.round_active = false
 		dm.alive = {}
+		dm.converting = {}
+		dm.death_pos = {}
 
 		-- Reset team state (mirrors ctf_teams.allocate_teams)
 		ctf_teams.player_team = {}
@@ -555,9 +768,31 @@ function dm.make_mode(def)
 				participants[p:get_player_name()] = true
 				idx = idx % #teamnames + 1
 			end
+		elseif is_infection then
+			-- Every colour is a team. Colours are handed out at random, and once
+			-- they run out players double up onto shared colours rather than being
+			-- benched - everyone plays, nobody spectates.
+			local colors = table.copy(dm.infection_teams)
+			table.shuffle(colors)
+
+			local num_teams = math.max(1, math.min(#players, #colors))
+
+			for i = 1, num_teams do
+				local tname = colors[i]
+				ctf_teams.online_players[tname] = {count = 0, players = {}}
+				table.insert(ctf_teams.current_team_list, tname)
+			end
+
+			-- players is already shuffled, so round-robin assignment keeps team
+			-- sizes even (differing by at most one) while staying random.
+			for i, p in ipairs(players) do
+				local tname = colors[((i - 1) % num_teams) + 1]
+				team_of[p:get_player_name()] = tname
+				participants[p:get_player_name()] = true
+			end
 		else
-			-- Free-for-all: every player gets their own colour (capped by the number
-			-- of available colours). Extra players spectate until the next round.
+			-- Free-for-all Death Match: every player gets their own standard team
+			-- colour; players beyond the available colours spectate this round.
 			local colors = {}
 			for _, c in ipairs(ctf_teams.teamlist) do
 				if not ctf_teams.team[c].not_playing then
@@ -622,6 +857,10 @@ function dm.make_mode(def)
 	end
 
 	return {
+		-- Infection converts a killed player instead of eliminating them, so they
+		-- keep their inventory through the death rather than dropping it.
+		keep_inventory_on_death = is_infection or nil,
+
 		treasures = def.treasures,
 		crafts = def.crafts,
 		team_chest_items = def.team_chest_items,
@@ -653,6 +892,16 @@ function dm.make_mode(def)
 
 		allocate_teams = allocate_teams,
 		team_allocator = function()
+			-- Infection: mid-round joiners double up on a random existing team and
+			-- spawn straight in (see on_allocplayer).
+			if is_infection then
+				local list = ctf_teams.current_team_list
+				if #list > 0 then
+					return list[math.random(#list)]
+				end
+				return nil
+			end
+
 			-- Used for mid-round joins: drop them on the least-populated existing
 			-- team (purely for infra; they are turned into a spectator immediately).
 			local best, best_count
@@ -691,9 +940,16 @@ function dm.make_mode(def)
 				ctf_modebase.update_playertags()
 			end
 
-			-- A player joining while a round is underway sits it out.
-			if not dm.round_starting and dm.round_active then
-				dm.make_spectator(player, true)
+			-- A player joining while a round is underway. An Infection team-switch
+			-- also routes through here, but must keep fighting rather than spectate,
+			-- so conversions (converting flag) are skipped.
+			if not dm.round_starting and dm.round_active and not dm.converting[player:get_player_name()] then
+				if is_infection then
+					-- Infection has no spectators: spawn the joiner straight in.
+					infection_join_midround(player)
+				else
+					dm.make_spectator(player, true)
+				end
 			end
 		end,
 
@@ -723,6 +979,38 @@ function dm.make_mode(def)
 			local pname = player:get_player_name()
 			if not dm.alive[pname] then return end
 
+			if is_infection then
+				local victim_team = ctf_teams.get(pname)
+				dm.death_pos[pname] = player:get_pos()
+
+				-- Work out who infected the victim. For punch deaths the killer is
+				-- on the damage reason (combat mode has already ended and scored
+				-- the kill by this point). For everything else, blame the last
+				-- hitter and score it like a normal environmental death.
+				local killer
+				if reason.type == "punch" and reason.object and reason.object:is_player() then
+					killer = reason.object:get_player_name()
+				else
+					killer = ctf_combat_mode.get_last_hitter(pname)
+					score_environmental_death(pname)
+				end
+
+				local killer_team
+				if killer and killer ~= pname and dm.alive[killer] then
+					killer_team = ctf_teams.get(killer)
+					if killer_team == victim_team then killer_team = nil end
+				end
+
+				-- Convert on the next step, once the engine has finished the death.
+				minetest.after(0, function()
+					local p = minetest.get_player_by_name(pname)
+					if p and dm.alive[pname] then
+						infect_player(p, killer_team or victim_team, victim_team)
+					end
+				end)
+				return
+			end
+
 			-- Punch kills are scored in on_punchplayer; only score other deaths here.
 			if reason.type ~= "punch" then
 				score_environmental_death(pname)
@@ -747,10 +1035,14 @@ function dm.make_mode(def)
 			local pname = player:get_player_name()
 
 			-- A player who is still alive respawning (e.g. died before the match
-			-- started) is sent back into the map rather than made a spectator.
+			-- started, or an Infection player who clicked respawn before the
+			-- conversion ran) is sent back into the map rather than made a
+			-- spectator. In Infection, keep them where they fell.
 			if dm.alive[pname] then
-				if ctf_map.current_map then
-					player:set_pos(ctf_map.current_map.flag_center)
+				local pos = (is_infection and dm.death_pos[pname])
+					or (ctf_map.current_map and ctf_map.current_map.flag_center)
+				if pos then
+					player:set_pos(pos)
 				end
 				return
 			end
@@ -841,13 +1133,17 @@ dm.team_chest_items = {
 
 -- Registers a deathmatch mode. Call this from each mode's own mod so that the
 -- persistent rankings get a per-mod namespace (see ctf_rankings:init).
-function dm.register(name, is_teams)
+--
+-- is_infection: variant where killed players switch to their killer's team
+-- instead of being eliminated; implies a team-based game.
+function dm.register(name, is_teams, is_infection)
 	local rankings = ctf_rankings:init(dm.RANKLIST)
 	local recent_rankings = ctf_modebase.recent_rankings(rankings)
 	local features = ctf_modebase.features(rankings, recent_rankings)
 
 	ctf_modebase.register_mode(name, dm.make_mode({
 		is_teams = is_teams,
+		is_infection = is_infection,
 		rankings = rankings,
 		recent_rankings = recent_rankings,
 		features = features,

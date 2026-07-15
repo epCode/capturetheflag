@@ -23,8 +23,8 @@ local function drop_flags(player, pteam)
 		end
 	end
 
-	if player_api.players[pname] then
-		player_api.set_texture(player, 2, "blank.png")
+	if ctf_player and ctf_player.set_flag then
+		ctf_player.set_flag(player, nil)
 	end
 
 	ctf_modebase.taken_flags[pname] = nil
@@ -80,9 +80,9 @@ function ctf_modebase.flag_on_punch(puncher, nodepos, node)
 		table.insert(ctf_modebase.taken_flags[pname], target_team)
 		ctf_modebase.flag_taken[target_team] = {p=pname, t=pteam}
 
-		player_api.set_texture(puncher, 2,
-			"default_wood.png^([combine:16x16:4,0=wool_white.png^[colorize:"..ctf_teams.team[target_team].color..":200)"
-		)
+		if ctf_player and ctf_player.set_flag then
+			ctf_player.set_flag(puncher, ctf_teams.team[target_team].color)
+		end
 
 		ctf_modebase.skip_vote.on_flag_take()
 		ctf_modebase:get_current_mode().on_flag_take(puncher, target_team)
@@ -106,7 +106,9 @@ function ctf_modebase.flag_on_punch(puncher, nodepos, node)
 				ctf_modebase.flag_captured[flagteam] = true
 			end
 
-			player_api.set_texture(puncher, 2, "blank.png")
+			if ctf_player and ctf_player.set_flag then
+				ctf_player.set_flag(puncher, nil)
+			end
 
 			ctf_modebase.on_flag_capture(puncher, flagteams)
 
@@ -118,7 +120,9 @@ end
 
 ctf_api.register_on_match_end(function()
 	for pname in pairs(ctf_modebase.taken_flags) do
-		player_api.set_texture(minetest.get_player_by_name(pname), 2, "blank.png")
+		if ctf_player and ctf_player.set_flag then
+			ctf_player.set_flag(minetest.get_player_by_name(pname), nil)
+		end
 	end
 
 	ctf_modebase.taken_flags = {}

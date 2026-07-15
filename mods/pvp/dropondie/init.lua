@@ -26,6 +26,11 @@ end
 function dropondie.drop_all(player)
 	if not ctf_teams.get(player) then return end
 
+	-- Some modes (e.g. Infection) keep a killed player's inventory because death
+	-- just moves them to another team rather than eliminating them.
+	local mode = ctf_modebase and ctf_modebase:get_current_mode()
+	if mode and mode.keep_inventory_on_death then return end
+
 	ctf_modebase.player.remove_bound_items(player)
 	ctf_modebase.player.remove_initial_stuff(player)
 

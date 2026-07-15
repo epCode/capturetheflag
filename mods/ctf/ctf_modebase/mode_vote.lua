@@ -1,5 +1,9 @@
 local VOTING_TIME = 30
 local MAX_ROUNDS = 5
+-- Players with the "server" priv get an extra field to vote for a custom number
+-- of matches beyond the fixed 0..MAX_ROUNDS buttons. Capped so a stray keystroke
+-- can't queue up thousands of matches.
+local MAX_CUSTOM_ROUNDS = 100
 
 local timer = nil
 local formspec_send_timer = nil
@@ -49,6 +53,9 @@ local function show_modechoose_form(player)
 		return
 	end
 
+	-- Server admins may vote an arbitrary match count, not just the fixed buttons.
+	local can_custom = minetest.check_player_privs(player, {server = true})
+
 	ctf_gui.show_formspec(player, "ctf_modebase:mode_select", function(ctx)
 		-- EDITOR: Fix crash
 		-- local S = function(x) return x end
@@ -69,8 +76,20 @@ local function show_modechoose_form(player)
 			"button_exit[3.7,5.5;1.4,0.7;vote;3]",
 			"button_exit[3.7,6.5;1.4,0.7;vote;4]",
 			"button_exit[3.7,7.5;1.4,0.7;vote;5]",
-			"button_exit[2.9,9.5;3.0,0.7;quit_button;Exit Game]",
 		}
+
+		-- Custom match-count entry, shown only to players with the "server" priv.
+		if can_custom then
+			out[#out + 1] = {
+				"hypertext[0.2,8.35;8.3,0.6;custom_note;<center>%s</center>]",
+				S("Server priv: vote a custom number of matches (0-@1)", MAX_CUSTOM_ROUNDS)
+			}
+			out[#out + 1] = "field[2.6,8.85;2.2,0.7;custom_length;;]"
+			out[#out + 1] = "field_close_on_enter[custom_length;false]"
+			out[#out + 1] = {"button_exit[4.9,8.85;1.4,0.7;custom_vote;%s]", S("Vote")}
+		end
+
+		out[#out + 1] = "button_exit[2.9,9.9;3.0,0.7;quit_button;Exit Game]"
 
 		return ctf_gui.list_to_formspec_str(out)
 	end, {
@@ -86,6 +105,21 @@ local function show_modechoose_form(player)
 
 				if type(vnum) == "number" and vnum >= 0 and vnum <= 5 then
 					player_vote(player, vnum)
+				end
+			end
+
+			-- Custom match count (server priv only). Re-check the priv here so a
+			-- crafted formspec submission can't smuggle a custom vote through.
+			if fields.custom_vote and minetest.check_player_privs(pname, {server = true}) then
+				local vnum = tonumber(fields.custom_length)
+
+				if type(vnum) == "number" and vnum >= 0 then
+					vnum = math.floor(vnum)
+					if vnum > MAX_CUSTOM_ROUNDS then vnum = MAX_CUSTOM_ROUNDS end
+					player_vote(player, vnum)
+				else
+					minetest.chat_send_player(pname, S("Invalid custom match count: @1",
+						tostring(fields.custom_length)))
 				end
 			end
 		end
@@ -157,10 +191,17 @@ function ctf_modebase.mode_vote.end_vote()
 	votes = nil
 	voted = nil
 
+	-- Normally votes span 0..MAX_ROUNDS, but a server-priv custom vote can go
+	-- higher, so tally up to the largest value actually cast.
+	local max_length = MAX_ROUNDS
+	for length in pairs(length_votes) do
+		if length > max_length then max_length = length end
+	end
+
 	local votes_result = ""
 	local average_vote = 0
 	local entry_count = 0
-	for length = 0, MAX_ROUNDS do
+	for length = 0, max_length do
 		local vote_count = length_votes[length]
 		if vote_count then
 			votes_result = votes_result .. string.format(

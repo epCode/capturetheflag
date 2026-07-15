@@ -40,7 +40,7 @@ wield_scale = wield_scale and tonumber(wield_scale) or 0.25 -- default scale
 
 local location = {
 	"Arm_Right", -- default bone
-	{x = 0, y = 5.5, z = 3}, -- default position
+	{x = 0, y = 7.5, z = 1.5}, -- default position
 	{x = -90, y = 225, z = 90}, -- default rotation
 	{x = wield_scale, y = wield_scale},
 }
