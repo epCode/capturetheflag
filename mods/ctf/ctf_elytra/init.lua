@@ -271,7 +271,6 @@ function elytra_entity:consume_durability(dtime)
 
 	local player = self.driver
 	local name = player:get_player_name()
-	if core.is_creative_enabled(name) then return end
 
 	local stack = equipped[name]
 	if not stack then
