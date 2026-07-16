@@ -81,10 +81,10 @@ default:lava_source;1;10;1;0.2;1;default:water_source;1;10;1;0.2;1;
 #### Map Initial Stuff
 `initial_stuff` are the items given to players at their (re)spawn. The `initial_stuff` field is located in the `map.conf` file. At least a pickaxe and some torches should be given in the map's `initial_stuff`.
 
-An example of `initial_stuff` value that registers a stone pickaxe, 30 cobblestones, 5 torches and a pistol is given below.
+An example of `initial_stuff` value that registers a stone pickaxe, 30 cobblestones and 5 torches is given below.
 
 ```
-default:pick_stone,default:cobble 30,default:torch 5,ctf_ranged:pistol_loaded
+default:pick_stone,default:cobble 30,default:torch 5
 ```
 
 #### Map Constants

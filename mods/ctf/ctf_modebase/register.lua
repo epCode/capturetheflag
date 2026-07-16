@@ -176,16 +176,6 @@ minetest.register_allow_player_inventory_action(function(player, action, invento
 	end
 end)
 
-ctf_ranged.can_use_gun = function(player, name)
-	local current_mode = ctf_modebase:get_current_mode()
-
-	if current_mode and current_mode.is_restricted_item then
-		return not current_mode.is_restricted_item(player, name)
-	end
-
-	return true
-end
-
 function ctf_modebase.match_mode(param)
 	local _, _, opt_param, mode_param = string.find(param, "^(.*) +mode:([^ ]*)$")
 

@@ -7,7 +7,7 @@
 	  * Defines the gun roster + a simple, editable rarity table.
 	  * Generates guns/mags/ammo in loot chests (loaded 60%-100%, with spare
 	    mags and loose bullets scaled to each gun's rarity).
-	  * Makes sure the old built-in ctf_ranged guns never spawn.
+	  * Makes sure the old built-in guns never spawn.
 	  * Provides loaded-gun helpers used by the class loadouts.
 	  * Registers ammo crafting and enforces class usage restrictions.
 
@@ -170,7 +170,7 @@ end
 
 -- Items from the (now removed) built-in gun system that must never spawn.
 local function is_blocked_loot(item)
-	return item:find("^ctf_ranged:") or item:find("^ctf_mode_classes:ranged_rifle")
+	return item:find("^ctf_mode_classes:ranged_rifle")
 end
 
 -- Use CTF's treasure API instead of monkeypatching: block the old guns and add
@@ -192,7 +192,7 @@ end)
 --------------------------------------------------------------------------------
 -- Class usage restrictions
 --------------------------------------------------------------------------------
--- Mirror the behaviour ctf_ranged had: let the current mode forbid guns
+-- Mirror the behaviour the old gun system had: let the current mode forbid guns
 -- (used by the classes mode's disallowed_items list).
 function bestguns.can_use_gun(player, gun_name)
 	local mode = ctf_modebase:get_current_mode()
@@ -203,7 +203,7 @@ function bestguns.can_use_gun(player, gun_name)
 end
 
 --------------------------------------------------------------------------------
--- Ammo crafting (replaces the old craftable ctf_ranged:ammo)
+-- Ammo crafting (replaces the old craftable ammo)
 --------------------------------------------------------------------------------
 -- output ; recipe items
 local ammo_crafts = {

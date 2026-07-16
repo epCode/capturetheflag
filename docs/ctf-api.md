@@ -372,25 +372,6 @@ This modpack consists of multiple mods.
 * `def` *ItemDef*: Item definition. (Needed: `description`, `inventory_image`, `inventory_overlay`, `wield_image`, `full_punch_interval`, `damage_groups`,`tool_capabilities`,`damage_groups` )
 * ??? Difference between the two?
 
-### ctf_ranged
-#### `ctf_ranged.can_use_gun(player, name)`
-* `player` *PlayerObj*: Player
-* `name` *string*: Player name
-* returns *boolean*
-* can be overriden for custom behavior.
-
-#### `ctf_ranged.simple_register_gun(name, def)`
-* `name` *string*: Item name of the gun.
-* `def` *ItemDef*: Item definition. (Needed: `description`, `texture`, `rounds`, `type`, `inventory_image`, `inventory_overlay`, `wield_image`, `full_punch_interval`, `damage_groups`, `rightclick_func` )
-
-#### `ctf_ranged.show_scope(name, item_name, fov_mult)`
-* `name` *string*: Player name
-* `item_name` *string*: Item name
-* `fov_mult` *integer*: FOV Multiplier.
-
-#### `ctf_ranged.hide_scope(name)`
-* `name` *string*: Player name
-
 ## ctf_core
 #### `ctf_core.init_cooldowns()`
 * returns a table of `players`(table) and functions `set`, `get`.

@@ -133,6 +133,54 @@ function dm.register_infection_teams(count)
 end
 
 --------------------------------------------------------------------------------
+-- Infection colour preference (a persisted "favourite colour" queue)
+--------------------------------------------------------------------------------
+
+-- Per-player tally of how many rounds they have spent on each colour, saved in
+-- mod storage. It's keyed by the colour's hex string (stable even if the team
+-- pool or its ordering changes later), not by team name. Infection allocation
+-- reads it to hand each player their most-used colour that is still free, then
+-- their next-most-used, and so on down their personal queue.
+local storage = minetest.get_mod_storage()
+
+-- [pname] = { [color_hex] = count }, lazily loaded from storage.
+dm.color_counts = {}
+
+-- The colour-hex key a team is tracked under (falls back to the team name).
+local function team_color_key(tname)
+	local team = ctf_teams.team[tname]
+	return (team and team.color) or tname
+end
+
+local function load_color_counts(pname)
+	local c = dm.color_counts[pname]
+	if c then return c end
+
+	c = {}
+	local raw = storage:get_string("colorcount_" .. pname)
+	if raw ~= "" then
+		local parsed = minetest.parse_json(raw)
+		if type(parsed) == "table" then c = parsed end
+	end
+
+	dm.color_counts[pname] = c
+	return c
+end
+
+-- The player's lifetime count for the colour of team `tname` (0 if never).
+local function color_use_count(pname, tname)
+	return load_color_counts(pname)[team_color_key(tname)] or 0
+end
+
+-- Record that `pname` was given team `tname`'s colour for a round, and persist.
+local function record_color_use(pname, tname)
+	local c = load_color_counts(pname)
+	local key = team_color_key(tname)
+	c[key] = (c[key] or 0) + 1
+	storage:set_string("colorcount_" .. pname, minetest.write_json(c))
+end
+
+--------------------------------------------------------------------------------
 -- Spawn point generation (players spawn where they can't see one another)
 --------------------------------------------------------------------------------
 
@@ -395,6 +443,8 @@ local function infection_join_midround(player)
 	end
 
 	ctf_modebase.give_immunity(player, INFECT_IMMUNITY_SECONDS)
+
+	dm.update_roster_hud()
 end
 
 -- Two-colour particle burst played when a player is infected: a puff in their
@@ -531,6 +581,8 @@ end
 ctf_api.register_on_match_end(function()
 	dm.round_active = false
 
+	dm.clear_roster_hud()
+
 	for pname in pairs(table.copy(dm.spectators)) do
 		local player = minetest.get_player_by_name(pname)
 		if player then
@@ -545,6 +597,121 @@ ctf_api.register_on_match_end(function()
 	dm.converting = {}
 	dm.death_pos = {}
 end)
+
+--------------------------------------------------------------------------------
+-- Infection team roster HUD (top-right list of teams + their living members)
+--------------------------------------------------------------------------------
+
+-- One header element plus a fixed pool of line elements per player. We reuse the
+-- same elements across updates (hud_change) rather than removing/re-adding them,
+-- so the roster never flickers. [pname] = {header = id, lines = {id, ...}}
+dm.roster_hud = {}
+
+-- Caps the number of teams shown; matches the Infection team pool size.
+local ROSTER_MAX_LINES = 10
+-- Vertical spacing between roster lines, in pixels.
+local ROSTER_LINE_H = 18
+-- Distance the whole roster is nudged in from the top-right corner.
+local ROSTER_INSET_X = -10
+local ROSTER_INSET_Y = 12
+
+-- Lazily create (once) the HUD elements this player's roster is drawn with.
+local function ensure_roster_hud(player)
+	local pname = player:get_player_name()
+	local h = dm.roster_hud[pname]
+	if h then return h end
+
+	h = {lines = {}}
+
+	h.header = player:hud_add({
+		hud_elem_type = "text",
+		position = {x = 1, y = 0},
+		alignment = {x = -1, y = 1},
+		offset = {x = ROSTER_INSET_X, y = ROSTER_INSET_Y},
+		text = "",
+		number = 0xFFFFFF,
+		style = 1, -- bold
+		z_index = 100,
+	})
+
+	for i = 1, ROSTER_MAX_LINES do
+		h.lines[i] = player:hud_add({
+			hud_elem_type = "text",
+			position = {x = 1, y = 0},
+			alignment = {x = -1, y = 1},
+			offset = {x = ROSTER_INSET_X, y = ROSTER_INSET_Y + i * ROSTER_LINE_H},
+			text = "",
+			number = 0xFFFFFF,
+			z_index = 100,
+		})
+	end
+
+	dm.roster_hud[pname] = h
+	return h
+end
+
+-- Rebuilds the "who is on which team" roster and pushes it to every connected
+-- player. Each team gets one line, listing its living members, drawn in that
+-- team's colour so the colour itself identifies the team. Called from Infection
+-- whenever team membership changes (round start, infection, join, leave).
+function dm.update_roster_hud()
+	-- Group living players by team.
+	local members = {}
+	for pname in pairs(dm.alive) do
+		local team = ctf_teams.get(pname)
+		if team then
+			members[team] = members[team] or {}
+			table.insert(members[team], pname)
+		end
+	end
+
+	-- Only list teams that still have players, in the stable team-list order.
+	local order = {}
+	for _, tname in ipairs(ctf_teams.current_team_list) do
+		if members[tname] then
+			table.sort(members[tname])
+			table.insert(order, tname)
+		end
+	end
+
+	for _, player in ipairs(minetest.get_connected_players()) do
+		local h = ensure_roster_hud(player)
+
+		player:hud_change(h.header, "text", #order > 0 and "Teams" or "")
+
+		for i = 1, ROSTER_MAX_LINES do
+			local tname = order[i]
+			if tname then
+				local team = ctf_teams.team[tname]
+				player:hud_change(h.lines[i], "number", (team and team.color_hex) or 0xFFFFFF)
+				player:hud_change(h.lines[i], "text", table.concat(members[tname], ", "))
+			else
+				player:hud_change(h.lines[i], "text", "")
+			end
+		end
+	end
+end
+
+-- Removes the roster HUD from one player and forgets their elements.
+local function clear_roster_hud_player(player)
+	local pname = player:get_player_name()
+	local h = dm.roster_hud[pname]
+	if not h then return end
+
+	player:hud_remove(h.header)
+	for _, id in ipairs(h.lines) do
+		player:hud_remove(id)
+	end
+	dm.roster_hud[pname] = nil
+end
+
+-- Tears down the roster for everyone (round/match end, mode switch).
+function dm.clear_roster_hud()
+	for _, player in ipairs(minetest.get_connected_players()) do
+		clear_roster_hud_player(player)
+	end
+	dm.roster_hud = {}
+end
 
 --------------------------------------------------------------------------------
 -- Mode factory
@@ -609,6 +776,8 @@ function dm.make_mode(def)
 	local function declare_winner(team)
 		dm.round_active = false
 
+		dm.clear_roster_hud()
+
 		local survivors = {}
 		for pname in pairs(dm.alive) do
 			if ctf_teams.get(pname) == team then
@@ -654,6 +823,8 @@ function dm.make_mode(def)
 
 	local function declare_draw()
 		dm.round_active = false
+
+		dm.clear_roster_hud()
 
 		ctf_modebase.summary.set_winner(S("Nobody survived - it's a draw!"))
 		show_summary(S("Draw - Nobody survived!"))
@@ -724,6 +895,8 @@ function dm.make_mode(def)
 
 		dm.death_pos[pname] = nil
 
+		dm.update_roster_hud()
+
 		check_round_end()
 	end
 
@@ -769,26 +942,84 @@ function dm.make_mode(def)
 				idx = idx % #teamnames + 1
 			end
 		elseif is_infection then
-			-- Every colour is a team. Colours are handed out at random, and once
-			-- they run out players double up onto shared colours rather than being
-			-- benched - everyone plays, nobody spectates.
-			local colors = table.copy(dm.infection_teams)
-			table.shuffle(colors)
+			-- Every colour is a team, handed out by each player's persisted colour
+			-- preference: they get the most-used colour still free, then their next,
+			-- and so on. Once every colour is in use the remaining players double up
+			-- onto whichever in-play colour they've used most (ties broken toward the
+			-- smallest team). Everyone plays, nobody spectates.
+			local all_colors = table.copy(dm.infection_teams)
+			table.shuffle(all_colors) -- random tiebreak among equally-used colours
 
-			local num_teams = math.max(1, math.min(#players, #colors))
+			local num_teams = math.min(#players, #all_colors)
 
-			for i = 1, num_teams do
-				local tname = colors[i]
-				ctf_teams.online_players[tname] = {count = 0, players = {}}
-				table.insert(ctf_teams.current_team_list, tname)
+			-- Strongest-preference-first: someone who has mained a colour for many
+			-- rounds gets first dibs on it over someone who's barely touched it.
+			local function top_pref(p)
+				local best = 0
+				for _, tname in ipairs(all_colors) do
+					best = math.max(best, color_use_count(p:get_player_name(), tname))
+				end
+				return best
+			end
+			table.sort(players, function(a, b) return top_pref(a) > top_pref(b) end)
+
+			local available = {}
+			for _, tname in ipairs(all_colors) do available[tname] = true end
+
+			-- The still-free colour this player has used the most.
+			local function best_available(pname)
+				local pick, pick_n
+				for _, tname in ipairs(all_colors) do
+					if available[tname] then
+						local n = color_use_count(pname, tname)
+						if not pick_n or n > pick_n then
+							pick, pick_n = tname, n
+						end
+					end
+				end
+				return pick
 			end
 
-			-- players is already shuffled, so round-robin assignment keeps team
-			-- sizes even (differing by at most one) while staying random.
-			for i, p in ipairs(players) do
-				local tname = colors[((i - 1) % num_teams) + 1]
-				team_of[p:get_player_name()] = tname
-				participants[p:get_player_name()] = true
+			local used_teams = {}
+			local team_size = {}
+
+			-- Phase 1: give the first `num_teams` players a distinct favourite colour.
+			for i = 1, num_teams do
+				local p = players[i]
+				if not p then break end
+				local pname = p:get_player_name()
+				local tname = best_available(pname)
+				available[tname] = nil
+				ctf_teams.online_players[tname] = {count = 0, players = {}}
+				table.insert(ctf_teams.current_team_list, tname)
+				table.insert(used_teams, tname)
+				team_size[tname] = 1
+				team_of[pname] = tname
+				participants[pname] = true
+			end
+
+			-- Phase 2: everyone left doubles up on their most-used in-play colour,
+			-- breaking ties toward the smallest team so sizes stay even.
+			for i = num_teams + 1, #players do
+				local pname = players[i]:get_player_name()
+				local pick, pick_n, pick_sz
+				for _, tname in ipairs(used_teams) do
+					local n = color_use_count(pname, tname)
+					local sz = team_size[tname]
+					if not pick or n > pick_n or (n == pick_n and sz < pick_sz) then
+						pick, pick_n, pick_sz = tname, n, sz
+					end
+				end
+				if pick then
+					team_size[pick] = team_size[pick] + 1
+					team_of[pname] = pick
+					participants[pname] = true
+				end
+			end
+
+			-- Bank each player's colour so their preference builds over time.
+			for pname in pairs(participants) do
+				record_color_use(pname, team_of[pname])
 			end
 		else
 			-- Free-for-all Death Match: every player gets their own standard team
@@ -854,6 +1085,11 @@ function dm.make_mode(def)
 		end
 
 		dm.round_active = true
+
+		-- Show the starting teams in the top-right corner (Infection only).
+		if is_infection then
+			dm.update_roster_hud()
+		end
 	end
 
 	return {
@@ -966,6 +1202,12 @@ function dm.make_mode(def)
 				physics.remove(pname, "ctf_mode_deathmatch:spectator")
 				restore_privs(pname, spec.privs)
 				dm.spectators[pname] = nil
+			end
+
+			-- Drop the leaver from the roster and refresh it for everyone else.
+			dm.roster_hud[pname] = nil
+			if is_infection and dm.round_active then
+				dm.update_roster_hud()
 			end
 
 			if was_alive then

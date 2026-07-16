@@ -52,7 +52,7 @@ local function update_huds(hunter, hunted)
 		hunt_huds:add(hunter, "hunted_mark_"..hunted, {
 			type = "image_waypoint",
 			image_scale = 1,
-			texture = "ctf_ranged_rifle_crosshair.png",
+			texture = "ctf_mode_classes_hunted_crosshair.png",
 			world_pos = core.get_player_by_name(hunted):get_pos():add(vector.new(0, 1, 0)),
 		})
 	else
@@ -161,7 +161,7 @@ core.register_craftitem("ctf_mode_classes:hunter_token", {
 
 core.register_craftitem("ctf_mode_classes:hunter_token_hunting", {
 	description = core.registered_items["ctf_mode_classes:hunter_token"].description,
-	inventory_image = "default_steel_block.png^ctf_ranged_rifle_crosshair.png^ctf_modebase_special_item.png",
+	inventory_image = "default_steel_block.png^ctf_mode_classes_hunted_crosshair.png^ctf_modebase_special_item.png",
 })
 
 local time = 0

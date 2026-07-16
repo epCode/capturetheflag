@@ -40,10 +40,28 @@ wield_scale = wield_scale and tonumber(wield_scale) or 0.25 -- default scale
 
 local location = {
 	"Arm_Right", -- default bone
-	{x = 0, y = 7.5, z = 1.5}, -- default position
+	{x = 0, y = 5, z = 4}, -- default position
 	{x = -90, y = 225, z = 90}, -- default rotation
 	{x = wield_scale, y = wield_scale},
 }
+
+-- Guns from bestguns / bestguns_guns (all share the `bestguns:` item prefix)
+-- are long and sit better further down the arm than the default wield pose.
+local gun_location = {
+	location[1],
+	{x = 0, y = 7.5, z = 0.8},
+	location[3],
+	location[4],
+}
+
+-- Resolve the attach info for an item: bestguns guns get the gun pose, then
+-- fall back to any per-item override, then the default location.
+local function resolve_location(item)
+	if item and item:find("^bestguns:") then
+		return gun_location
+	end
+	return wield3d.location[item] or location
+end
 
 local function add_wield_entity(player)
 	if not player or not player:is_player() then
@@ -57,13 +75,16 @@ local function add_wield_entity(player)
 		if object then
 			local setting = ctf_settings.get(player, "use_old_wielditem_display")
 
-			object:set_attach(player, location[1], location[2], location[3], setting == "false")
+			-- Guns from bestguns / bestguns_guns get a gun-specific pose.
+			local loc = resolve_location(player:get_wielded_item():get_name())
+
+			object:set_attach(player, loc[1], loc[2], loc[3], setting == "false")
 			object:set_properties({
 				textures = {"wield3d:hand"},
-				visual_size = location[4],
+				visual_size = loc[4],
 			})
 			player:hud_set_flags({wielditem = (setting == "true")})
-			player_wielding[name] = {item = "", location = location}
+			player_wielding[name] = {item = "", location = {loc[1], loc[2], loc[3]}}
 		end
 	end
 end
@@ -125,7 +146,7 @@ function wield_entity:on_step(dtime)
 		if item == "" then
 			item = "wield3d:hand"
 		end
-		local loc = wield3d.location[item] or location
+		local loc = resolve_location(item)
 		if loc[1] ~= wield.location[1] or
 				not vector.equals(loc[2], wield.location[2]) or
 				not vector.equals(loc[3], wield.location[3]) then

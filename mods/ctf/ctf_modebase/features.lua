@@ -185,7 +185,6 @@ local death_messages = {
 	["axe"] = {"killed", "chopped up",},
 	["shovel"] = {"killed with the tool that dug your grave"},
 	["pick"] = {"killed", "mistaken for mese ore"},
-	["ctf_ranged"] = {"shot"},
 	["bestguns"] = {"shot", "gunned down"},
 	["rifle"] = {"sniped"},
 	["default_water"] = {"drowned", "over-hydrated"},
