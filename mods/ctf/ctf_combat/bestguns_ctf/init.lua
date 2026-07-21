@@ -190,6 +190,18 @@ ctf_modebase.register_stuff_expander(function(item)
 end)
 
 --------------------------------------------------------------------------------
+-- Grenade replacement
+--------------------------------------------------------------------------------
+-- Replace CTF's builtin frag grenade with the bestguns frag. We keep the item
+-- name "ctf_grenades:frag" and just override its definition, so every place that
+-- already hands out the frag -- class loadouts, loot chests, team chests, map
+-- initial_stuff/treasures -- gives out the bestguns grenade with no other changes.
+-- (Smoke and poison stay as they are; bestguns has no equivalent for those.)
+if bestguns.frag and minetest.registered_items["ctf_grenades:frag"] then
+	minetest.override_item("ctf_grenades:frag", bestguns.frag.item_fields("ctf_grenades:frag"))
+end
+
+--------------------------------------------------------------------------------
 -- Class usage restrictions
 --------------------------------------------------------------------------------
 -- Mirror the behaviour the old gun system had: let the current mode forbid guns

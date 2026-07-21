@@ -152,6 +152,21 @@ local function stop_flight(player)
 	end
 end
 
+-- Force-clear a player's elytra state: stop any glide, drop the worn elytra
+-- (consumed, not returned) and hide the wings. Used to wipe elytra between rounds
+-- so it is never kept from one round to the next.
+function ctf_elytra.reset(player)
+	if not player or not player:is_player() then return end
+	local name = player:get_player_name()
+	stop_flight(player)
+	equipped[name] = nil
+	flying[name] = nil
+	equip_hold[name] = nil
+	unequip_hold[name] = nil
+	jump_state[name] = nil
+	ctf_elytra.set_wings(player, false)
+end
+
 ------------------------------------------------------------------------
 -- Elytra glide entity (physics ported from Mineclonia)
 ------------------------------------------------------------------------

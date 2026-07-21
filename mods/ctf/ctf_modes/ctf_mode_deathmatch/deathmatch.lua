@@ -21,6 +21,20 @@ local CLUSTER_RADIUS = 6
 
 local MAX_HP = minetest.PLAYER_MAX_HP_DEFAULT * 10
 
+-- HP restored to a player for getting a kill, capped at their max HP. Rewards
+-- pushing through a firefight in the big deathmatch/infection HP pool.
+local KILL_HEAL = 100
+
+-- Heal `killer_name` for a kill, up to their max HP. No-op for an absent/offline
+-- killer (environmental deaths with no attribution, disconnects, etc.).
+local function reward_kill_hp(killer_name)
+	if not killer_name or killer_name == "" then return end
+	local killer = minetest.get_player_by_name(killer_name)
+	if not killer then return end
+	local hp_max = killer:get_properties().hp_max or MAX_HP
+	killer:set_hp(math.min(killer:get_hp() + KILL_HEAL, hp_max))
+end
+
 -- Grace period at the start of each round during which participants are fully
 -- immune (invulnerable + non-pointable), so nobody gets spawn-killed.
 local ROUND_IMMUNITY_SECONDS = 30
@@ -54,6 +68,28 @@ ctf_mode_deathmatch = {
 	-- [pname] = position the player last died at (Infection revives them there,
 	-- right next to whoever infected them).
 	death_pos = {},
+
+	-- [victim_pname] = { [hitter_pname] = total_damage } accumulated this life.
+	-- Infection reads this on death to send the victim to the team that hurt them
+	-- most, then clears the victim's entry so the next life starts fresh.
+	damage_dealt = {},
+
+	-- [tname] = pname of the player who founded that Infection colour team at round
+	-- start. This is the team's permanent name for the whole round: it never
+	-- changes, even if the founder is infected away onto another team and later
+	-- comes back. See dm.team_label().
+	team_owner = {},
+
+	-- [pname] = the teammate a freshly-infected player should reappear beside when
+	-- their respawn countdown finishes (the player who infected them). Cleared once
+	-- they respawn; the target is re-validated then in case it died in the interim.
+	pending_respawn = {},
+
+	-- [pname] = saved "main" inventory list (as item strings), taken when a player
+	-- dies. Infection preserves inventory across a death and respawn WITHIN a round
+	-- (the shared respawn code would otherwise wipe and re-gear them), but not
+	-- across rounds. See snapshot_inv()/restore_inv().
+	saved_inv = {},
 }
 local dm = ctf_mode_deathmatch
 
@@ -423,6 +459,66 @@ local function teleport_player(player, pos)
 	minetest.after(0.1, apply)
 end
 
+-- Is `pos` (feet) a safe place to stand: solid, non-hazard ground underneath and
+-- two nodes of clear air for the player's body? Reads the live map, so it only
+-- works where the area is loaded (always true right next to another player).
+local function is_safe_standing(pos)
+	local below = minetest.registered_nodes[minetest.get_node(vector.offset(pos, 0, -1, 0)).name]
+	local feet  = minetest.registered_nodes[minetest.get_node(pos).name]
+	local head  = minetest.registered_nodes[minetest.get_node(vector.offset(pos, 0, 1, 0)).name]
+	if not (below and feet and head) then return false end
+	if not below.walkable or below.drawtype == "airlike" then return false end
+	if below.damage_per_second and below.damage_per_second > 0 then return false end
+	if below.liquidtype and below.liquidtype ~= "none" then return false end
+	if feet.walkable or head.walkable then return false end
+	return true
+end
+
+-- Finds a safe standing spot within `radius` of `center` (a teammate's position),
+-- so an infected player reappears beside them without landing in a wall or on a
+-- hazard. Returns nil if nothing suitable turned up nearby.
+local function safe_spot_near(center, radius)
+	radius = radius or CLUSTER_RADIUS
+	for _ = 1, 30 do
+		local x = center.x + math.random(-radius, radius)
+		local z = center.z + math.random(-radius, radius)
+		for y = math.ceil(center.y) + 3, math.floor(center.y) - 8, -1 do
+			local p = vector.new(x, y, z)
+			if is_safe_standing(p) then
+				return p
+			end
+		end
+	end
+	return nil
+end
+
+-- The name an Infection team goes by: its founder, fixed for the whole round.
+-- Falls back to the raw team name only if the team was somehow never founded.
+function dm.team_label(tname)
+	return dm.team_owner[tname] or HumanReadable(tname)
+end
+
+-- Save a player's current "main" inventory (as item strings, preserving metadata
+-- such as loaded magazines) so it can be brought back after the shared respawn /
+-- new-match code wipes it.
+local function snapshot_inv(pname)
+	local player = minetest.get_player_by_name(pname)
+	if not player then return end
+
+	local out = {}
+	for i, stack in ipairs(player:get_inventory():get_list("main")) do
+		out[i] = stack:to_string()
+	end
+	dm.saved_inv[pname] = out
+end
+
+-- Authoritatively set a player's "main" inventory to their saved snapshot (empty
+-- if none). Used in Infection where there is no initial stuff: it both restores
+-- what they had and guarantees the shared "give initial stuff" is undone.
+local function restore_inv(player)
+	player:get_inventory():set_list("main", dm.saved_inv[player:get_player_name()] or {})
+end
+
 -- Infection has no spectators: a player who joins mid-round is dropped straight
 -- into the field on a (random) existing team with a short immunity, instead of
 -- being benched until the next round.
@@ -596,6 +692,10 @@ ctf_api.register_on_match_end(function()
 	dm.alive = {}
 	dm.converting = {}
 	dm.death_pos = {}
+	dm.damage_dealt = {}
+	dm.team_owner = {}
+	dm.pending_respawn = {}
+	dm.saved_inv = {}
 end)
 
 --------------------------------------------------------------------------------
@@ -683,8 +783,11 @@ function dm.update_roster_hud()
 			local tname = order[i]
 			if tname then
 				local team = ctf_teams.team[tname]
+				-- Each team is titled by its founder (fixed for the round), then its
+				-- current living members.
+				local text = dm.team_label(tname) .. ": " .. table.concat(members[tname], ", ")
 				player:hud_change(h.lines[i], "number", (team and team.color_hex) or 0xFFFFFF)
-				player:hud_change(h.lines[i], "text", table.concat(members[tname], ", "))
+				player:hud_change(h.lines[i], "text", text)
 			else
 				player:hud_change(h.lines[i], "text", "")
 			end
@@ -793,10 +896,11 @@ function dm.make_mode(def)
 		local win_text, summary_text
 
 		if is_infection then
-			win_text = S("@1 Team infected everyone and wins!", HumanReadable(team))
+			local label = dm.team_label(team)
+			win_text = S("@1's Team infected everyone and wins!", label)
 			summary_text = string.format(
 				"Team %s infected everyone (%d player(s))",
-				HumanReadable(team), #survivors
+				label, #survivors
 			)
 		elseif is_teams then
 			win_text = S("@1 Team Wins!", HumanReadable(team))
@@ -858,11 +962,126 @@ function dm.make_mode(def)
 		end
 	end
 
-	-- Infection: revive a just-killed player on `new_team` right where they fell,
-	-- next to whoever infected them. If new_team == old_team (a suicide or an
-	-- environmental death with no valid infector) they simply respawn on their
-	-- own side. Ends the round if this conversion left only one team standing.
-	local function infect_player(player, new_team, old_team)
+	-- Safety net: poll every SAFETY_INTERVAL seconds while a round is active and
+	-- run the same end-of-round test. The round normally ends the instant a
+	-- conversion/leave leaves one team standing (check_round_end is called at
+	-- those points), but this guards against a missed call ever leaving a round
+	-- stuck with everyone already on one team. A generation token makes sure only
+	-- the current round's loop runs, so rounds never stack timers.
+	local SAFETY_INTERVAL = 2
+	local function safety_tick(gen)
+		if gen ~= dm.safety_gen or not dm.round_active then return end
+		check_round_end()
+		-- check_round_end may have ended the round; only continue if it is still on.
+		if gen == dm.safety_gen and dm.round_active then
+			minetest.after(SAFETY_INTERVAL, safety_tick, gen)
+		end
+	end
+	local function start_safety_loop()
+		dm.safety_gen = (dm.safety_gen or 0) + 1
+		minetest.after(SAFETY_INTERVAL, safety_tick, dm.safety_gen)
+	end
+
+	-- True if team `tname` still has a living member other than `except` — i.e. it
+	-- has not been eradicated down to (at most) that one player. Players must never
+	-- be sent to, or respawn as, an eradicated team.
+	local function team_has_other_living(tname, except)
+		for other in pairs(dm.alive) do
+			if other ~= except and ctf_teams.get(other) == tname then
+				return true
+			end
+		end
+		return false
+	end
+
+	-- The still-living team with the most members, ignoring `except_team` and not
+	-- counting `except_player`. Used to move a player off an eradicated team.
+	local function biggest_other_team(except_team, except_player)
+		local counts = {}
+		for other in pairs(dm.alive) do
+			if other ~= except_player then
+				local t = ctf_teams.get(other)
+				if t and t ~= except_team then
+					counts[t] = (counts[t] or 0) + 1
+				end
+			end
+		end
+		local best, best_n
+		for t, n in pairs(counts) do
+			if not best_n or n > best_n then best, best_n = t, n end
+		end
+		return best
+	end
+
+	-- Infection: choose the team a just-killed player is converted onto. They
+	-- MUST leave their old team AND land on a team that is still alive, so
+	-- victim_team and any eradicated team are never returned while another team is
+	-- still in play. Preference order:
+	--   1. The killer's (last hitter's) current team — whoever landed the final
+	--      hit takes the infection.
+	--   2. The team that dealt the victim the most damage this life (tallied by
+	--      each hitter's *current* team, so merged teams pool their damage). Used
+	--      only when there is no valid killer team (e.g. environmental deaths).
+	--   3. Any other team still fighting, chosen at random.
+	-- Only if the victim's team is the sole team left does it stay put (the round
+	-- is about to end anyway).
+	local function pick_infection_team(pname, victim_team, killer_team)
+		-- 1. The killer's team, if it is a genuinely different, still-living one.
+		if killer_team and killer_team ~= victim_team
+		and team_has_other_living(killer_team, pname) then
+			return killer_team
+		end
+
+		-- 2. Most-damaging team, aggregated by the hitter's current team. Only
+		-- teams that are still alive (have a living member other than the victim)
+		-- are eligible.
+		local dmg = dm.damage_dealt[pname]
+		if dmg then
+			local by_team = {}
+			for hitter, amount in pairs(dmg) do
+				local hteam = ctf_teams.get(hitter)
+				if hteam and hteam ~= victim_team and team_has_other_living(hteam, pname) then
+					by_team[hteam] = (by_team[hteam] or 0) + amount
+				end
+			end
+			local best_team, best_dmg
+			for team, amount in pairs(by_team) do
+				if not best_dmg or amount > best_dmg then
+					best_dmg, best_team = amount, team
+				end
+			end
+			if best_team then return best_team end
+		end
+
+		-- 3. Any other team with living players, picked at random.
+		local others = {}
+		for other in pairs(dm.alive) do
+			if other ~= pname then
+				local team = ctf_teams.get(other)
+				if team and team ~= victim_team then
+					others[team] = true
+				end
+			end
+		end
+		local other_list = {}
+		for team in pairs(others) do
+			table.insert(other_list, team)
+		end
+		if #other_list > 0 then
+			return other_list[math.random(#other_list)]
+		end
+
+		-- 4. Nobody else left; stay put (round ends this step).
+		return victim_team
+	end
+
+	-- Infection: switch a just-killed player onto `new_team` and drop them into the
+	-- normal CTF respawn state (dead + frozen countdown) rather than reviving them
+	-- on the spot. `anchor` is the teammate they should reappear next to when they
+	-- respawn (see on_respawnplayer). They keep counting as a living member of the
+	-- new team throughout, so the roster and win check see the merge immediately.
+	-- Ends the round if this conversion left only one team standing.
+	local function infect_player(player, new_team, old_team, anchor)
 		local pname = player:get_player_name()
 		local pos = dm.death_pos[pname] or player:get_pos()
 
@@ -871,8 +1090,9 @@ function dm.make_mode(def)
 		dm.infection_burst(pos, old_color, new_color)
 
 		-- Switch team without tripping the mid-round spectator path in
-		-- on_allocplayer. This fires on_allocplayer, which heals the player to
-		-- full, re-gears them and recolours them for the new team.
+		-- on_allocplayer. This fires on_allocplayer, which re-gears and recolours
+		-- the player for the new team; the converting flag also tells it NOT to
+		-- heal them, so they stay dead and go through the respawn countdown.
 		dm.converting[pname] = true
 		ctf_teams.set(pname, new_team, true)
 		dm.converting[pname] = nil
@@ -880,24 +1100,56 @@ function dm.make_mode(def)
 		-- They never stopped being an active combatant.
 		dm.alive[pname] = true
 
-		-- Revive on the spot and dismiss the death screen.
-		teleport_player(player, pos)
-		minetest.close_formspec(pname, "")
-		ctf_modebase.give_immunity(player, INFECT_IMMUNITY_SECONDS)
+		-- Where to reappear on respawn: next to whoever infected them.
+		dm.pending_respawn[pname] = anchor
 
 		if new_team ~= old_team then
 			hud_events.new(player, {
 				quick = false,
-				text = S("You were infected! You now fight for the @1 team", HumanReadable(new_team)),
+				text = S("You were infected! You now fight for the @1 team",
+					dm.team_label(new_team)),
 				color = "warning",
 			})
 		end
 
-		dm.death_pos[pname] = nil
+		-- Damage from the life that just ended no longer applies.
+		dm.damage_dealt[pname] = nil
+
+		-- Enter the normal respawn state: brief death screen, then a frozen
+		-- countdown, then on_respawnplayer teleports them beside their new team.
+		ctf_modebase.prepare_respawn_delay(player)
 
 		dm.update_roster_hud()
 
 		check_round_end()
+	end
+
+	-- Infection: where a player reappears when their respawn countdown finishes.
+	-- Prefers a safe spot beside the teammate who infected them; if that teammate
+	-- has since been killed or left, beside any other living teammate; and failing
+	-- that, a fresh safe spawn somewhere on the map.
+	local function infection_respawn_pos(pname, team)
+		local anchor = dm.pending_respawn[pname]
+		if anchor and anchor ~= pname and dm.alive[anchor] and ctf_teams.get(anchor) == team then
+			local ap = minetest.get_player_by_name(anchor)
+			if ap then
+				return safe_spot_near(ap:get_pos()) or ap:get_pos()
+			end
+		end
+
+		for other in pairs(dm.alive) do
+			if other ~= pname and ctf_teams.get(other) == team then
+				local op = minetest.get_player_by_name(other)
+				if op then
+					return safe_spot_near(op:get_pos()) or op:get_pos()
+				end
+			end
+		end
+
+		if ctf_map.current_map then
+			local spawns = dm.compute_spawns(ctf_map.current_map, {[team] = {pname}})
+			return spawns and spawns[pname]
+		end
 	end
 
 	-- Allocate players into teams and scatter them to hidden spawn points.
@@ -907,6 +1159,12 @@ function dm.make_mode(def)
 		dm.alive = {}
 		dm.converting = {}
 		dm.death_pos = {}
+		dm.damage_dealt = {}
+		dm.team_owner = {}
+		dm.pending_respawn = {}
+		-- Inventory is never carried across rounds, so start the round with no
+		-- saved snapshots (they only bridge a death->respawn within a round).
+		dm.saved_inv = {}
 
 		-- Reset team state (mirrors ctf_teams.allocate_teams)
 		ctf_teams.player_team = {}
@@ -996,6 +1254,8 @@ function dm.make_mode(def)
 				team_size[tname] = 1
 				team_of[pname] = tname
 				participants[pname] = true
+				-- Founder of this colour's team; names it for the whole round.
+				dm.team_owner[tname] = pname
 			end
 
 			-- Phase 2: everyone left doubles up on their most-used in-play colour,
@@ -1086,6 +1346,10 @@ function dm.make_mode(def)
 
 		dm.round_active = true
 
+		-- Start the periodic safety check that ends the round if everyone ends up
+		-- on one team (bumps the generation token so any prior loop stops).
+		start_safety_loop()
+
 		-- Show the starting teams in the top-right corner (Infection only).
 		if is_infection then
 			dm.update_roster_hud()
@@ -1110,7 +1374,14 @@ function dm.make_mode(def)
 		-- Playable on every map.
 		any_map = true,
 
+		-- Infection gives no initial stuff at all - players start each round empty
+		-- and build up their own inventory, which persists through a death and
+		-- respawn within the round but not across rounds. Every other mode gets the
+		-- standard starter kit.
 		stuff_provider = function()
+			if is_infection then
+				return {}
+			end
 			return {
 				"ctf_melee:sword_steel",
 				"default:pick_stone",
@@ -1152,14 +1423,37 @@ function dm.make_mode(def)
 		end,
 
 		on_allocplayer = function(player, new_team)
+			local pname = player:get_player_name()
+			local converting = dm.converting[pname]
+
 			-- Restore in case the player spectated the previous round.
 			dm.restore_spectator(player)
 
-			player:set_hp(player:get_properties().hp_max)
+			-- Normally healed to full on (re)allocation. During an Infection
+			-- death-conversion the player must STAY dead so they go through the
+			-- respawn countdown, so skip the heal in that case.
+			if not converting then
+				player:set_hp(player:get_properties().hp_max)
+			end
 
 			ctf_modebase.update_wear.cancel_player_updates(player)
-			ctf_modebase.player.remove_bound_items(player)
-			ctf_modebase.player.give_initial_stuff(player)
+
+			if is_infection then
+				-- No initial stuff in Infection, and nothing is carried across
+				-- rounds: a fresh allocation (round start or mid-round join) starts
+				-- with an empty inventory and no elytra. A mid-round conversion
+				-- (converting) instead leaves the player's current inventory
+				-- untouched so they keep everything they were holding when infected.
+				if not converting then
+					player:get_inventory():set_list("main", {})
+					if ctf_elytra and ctf_elytra.reset then
+						ctf_elytra.reset(player)
+					end
+				end
+			else
+				ctf_modebase.player.remove_bound_items(player)
+				ctf_modebase.player.give_initial_stuff(player)
+			end
 
 			local tcolor = ctf_teams.team[new_team].color
 			player:hud_set_hotbar_image("gui_hotbar.png^[colorize:" .. tcolor .. ":128")
@@ -1179,7 +1473,7 @@ function dm.make_mode(def)
 			-- A player joining while a round is underway. An Infection team-switch
 			-- also routes through here, but must keep fighting rather than spectate,
 			-- so conversions (converting flag) are skipped.
-			if not dm.round_starting and dm.round_active and not dm.converting[player:get_player_name()] then
+			if not dm.round_starting and dm.round_active and not converting then
 				if is_infection then
 					-- Infection has no spectators: spawn the joiner straight in.
 					infection_join_midround(player)
@@ -1225,6 +1519,10 @@ function dm.make_mode(def)
 				local victim_team = ctf_teams.get(pname)
 				dm.death_pos[pname] = player:get_pos()
 
+				-- Remember the inventory they died with (kept through the death) so
+				-- it can be brought back after the shared respawn code wipes it.
+				snapshot_inv(pname)
+
 				-- Work out who infected the victim. For punch deaths the killer is
 				-- on the damage reason (combat mode has already ended and scored
 				-- the kill by this point). For everything else, blame the last
@@ -1239,18 +1537,40 @@ function dm.make_mode(def)
 
 				local killer_team
 				if killer and killer ~= pname and dm.alive[killer] then
+					reward_kill_hp(killer)
 					killer_team = ctf_teams.get(killer)
 					if killer_team == victim_team then killer_team = nil end
 				end
 
-				-- Convert on the next step, once the engine has finished the death.
-				minetest.after(0, function()
-					local p = minetest.get_player_by_name(pname)
-					if p and dm.alive[pname] then
-						infect_player(p, killer_team or victim_team, victim_team)
-					end
-				end)
+				-- A killed player MUST switch teams: send them to whoever hurt them
+				-- most, then the killer, then any other surviving team.
+				local new_team = pick_infection_team(pname, victim_team, killer_team)
+
+				-- The teammate they'll reappear beside on respawn: the player who
+				-- infected them, if that player is now on the same (new) team.
+				local anchor
+				if killer and killer ~= pname and dm.alive[killer]
+				and ctf_teams.get(killer) == new_team then
+					anchor = killer
+				end
+
+				-- Switch teams and enter the respawn state now, while the engine has
+				-- the player marked dead. infect_player keeps them dead (no revive) so
+				-- the standard respawn countdown runs, exactly like a normal CTF death.
+				infect_player(player, new_team, victim_team, anchor)
 				return
+			end
+
+			-- Reward the killer with a heal (any kill type). The puncher for a direct
+			-- kill, otherwise whoever last damaged the victim (fall/lava after a hit).
+			local killer
+			if reason.type == "punch" and reason.object and reason.object:is_player() then
+				killer = reason.object:get_player_name()
+			else
+				killer = ctf_combat_mode.get_last_hitter(pname)
+			end
+			if killer and killer ~= pname and dm.alive[killer] then
+				reward_kill_hp(killer)
 			end
 
 			-- Punch kills are scored in on_punchplayer; only score other deaths here.
@@ -1276,13 +1596,46 @@ function dm.make_mode(def)
 		on_respawnplayer = function(player)
 			local pname = player:get_player_name()
 
-			-- A player who is still alive respawning (e.g. died before the match
-			-- started, or an Infection player who clicked respawn before the
-			-- conversion ran) is sent back into the map rather than made a
-			-- spectator. In Infection, keep them where they fell.
+			-- Infection: an infected player's respawn countdown just finished. Drop
+			-- them back into the fight beside the teammate who infected them (or
+			-- another teammate / a fresh spawn if that one is already gone).
+			if is_infection and dm.alive[pname] then
+				local team = ctf_teams.get(pname)
+
+				-- Their team may have been eradicated (everyone else on it infected
+				-- away) while they were down. Never respawn as a wiped-out team: move
+				-- onto the largest still-living team instead.
+				if team and not team_has_other_living(team, pname) then
+					local newteam = biggest_other_team(team, pname)
+					if newteam then
+						dm.converting[pname] = true
+						ctf_teams.set(pname, newteam, true)
+						dm.converting[pname] = nil
+						team = newteam
+						dm.update_roster_hud()
+					end
+				end
+
+				local pos = team and infection_respawn_pos(pname, team)
+				if pos then
+					teleport_player(player, pos)
+				elseif ctf_map.current_map then
+					player:set_pos(ctf_map.current_map.flag_center)
+				end
+
+				-- Bring back the inventory they had before dying (the shared respawn
+				-- handler just emptied it and would otherwise leave them with nothing).
+				restore_inv(player)
+
+				dm.pending_respawn[pname] = nil
+				dm.death_pos[pname] = nil
+				return
+			end
+
+			-- Non-infection player still alive (e.g. died before the match started)
+			-- respawns back into the map rather than spectating.
 			if dm.alive[pname] then
-				local pos = (is_infection and dm.death_pos[pname])
-					or (ctf_map.current_map and ctf_map.current_map.flag_center)
+				local pos = ctf_map.current_map and ctf_map.current_map.flag_center
 				if pos then
 					player:set_pos(pos)
 				end
@@ -1311,10 +1664,27 @@ function dm.make_mode(def)
 			return features.can_punchplayer(player, hitter)
 		end,
 		on_punchplayer = function(player, hitter, damage, ...)
-			if not dm.alive[player:get_player_name()] or not dm.alive[hitter:get_player_name()] then
+			local pname = player:get_player_name()
+			local hname = hitter:get_player_name()
+			if not dm.alive[pname] or not dm.alive[hname] then
 				return false
 			end
-			return features.on_punchplayer(player, hitter, damage, ...)
+
+			local real_damage, err = features.on_punchplayer(player, hitter, damage, ...)
+
+			-- Infection: remember how much each attacker has hurt this player so
+			-- that, on death, they can be sent to the team that hurt them most.
+			if is_infection and type(real_damage) == "number" and real_damage > 0
+			and hname ~= pname then
+				local tally = dm.damage_dealt[pname]
+				if not tally then
+					tally = {}
+					dm.damage_dealt[pname] = tally
+				end
+				tally[hname] = (tally[hname] or 0) + real_damage
+			end
+
+			return real_damage, err
 		end,
 		on_healplayer = features.on_healplayer,
 
